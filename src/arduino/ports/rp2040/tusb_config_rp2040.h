@@ -140,19 +140,17 @@ extern "C" {
 // Enable tuh_edpt_xfer() API
 // #define CFG_TUH_API_EDPT_XFER       1
 
-// Number of mass storage
-#define CFG_TUH_MSC 1
+// The product hosts MIDI class devices only; MSC, HID and CDC (and the
+// CDC-API serial bridges) are not compiled in. A device without a driver
+// enumerates and stays idle.
+#define CFG_TUH_MSC 0
 
-// Number of HIDs
-// typical keyboard + mouse device can have 3,4 HID interfaces
-#define CFG_TUH_HID (3 * CFG_TUH_DEVICE_MAX)
+#define CFG_TUH_HID 0
 
-// Number of CDC interfaces
-// FTDI and CP210x are not part of CDC class, only to re-use CDC driver API
-#define CFG_TUH_CDC 1
-#define CFG_TUH_CDC_FTDI 1
-#define CFG_TUH_CDC_CP210X 1
-#define CFG_TUH_CDC_CH34X 1
+#define CFG_TUH_CDC 0
+#define CFG_TUH_CDC_FTDI 0
+#define CFG_TUH_CDC_CP210X 0
+#define CFG_TUH_CDC_CH34X 0
 
 // RX & TX fifo size
 #define CFG_TUH_CDC_RX_BUFSIZE 128
