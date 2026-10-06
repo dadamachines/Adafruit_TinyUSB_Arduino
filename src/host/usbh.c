@@ -305,6 +305,8 @@ TU_ATTR_ALWAYS_INLINE static inline usbh_device_t* get_device(uint8_t dev_addr) 
 }
 
 static bool enum_new_device(hcd_event_t* event);
+static bool enum_wait_due(void);
+static void enum_wait_run(void);
 static void process_removing_device(uint8_t rhport, uint8_t hub_addr, uint8_t hub_port);
 static bool usbh_edpt_control_open(uint8_t dev_addr, uint8_t max_packet_size);
 static bool usbh_control_xfer_cb (uint8_t daddr, uint8_t ep_addr, xfer_result_t result, uint32_t xferred_bytes);
@@ -481,7 +483,7 @@ bool tuh_task_event_ready(void) {
   // Skip if stack is not initialized
   if ( !tuh_inited() ) return false;
 
-  return !osal_queue_empty(_usbh_q);
+  return !osal_queue_empty(_usbh_q) || enum_wait_due();
 }
 
 /* USB Host Driver task
@@ -507,6 +509,8 @@ void tuh_task_ext(uint32_t timeout_ms, bool in_isr) {
 
   // Skip if stack is not initialized
   if (!tuh_inited()) return;
+
+  enum_wait_run();
 
   // Loop until there is no more events in the queue
   while (1) {
@@ -1339,6 +1343,38 @@ static bool enum_request_set_addr(void);
 static bool _parse_configuration_descriptor (uint8_t dev_addr, tusb_desc_configuration_t const* desc_cfg);
 static void enum_full_complete(void);
 
+// A wait the enumeration used to sleep for arms a deadline; tuh_task runs the next step once it is due.
+enum {
+  WAIT_NONE,
+  WAIT_RESET_END,       // root port: end the reset, then debounce
+  WAIT_ROOT_STABLE,     // root port: debounce over, start the control transfers
+  WAIT_HUB_STABLE,      // hub port: debounce over, get the port status
+  WAIT_HUB_STATUS,      // hub port: reset over, get the port status
+  WAIT_ADDR_RECOVERY,   // device addressed: open its control pipe
+  WAIT_RETRY            // failed control transfer: send it again
+};
+
+static struct {
+  uint32_t due_us;
+  uint8_t step;
+  tuh_xfer_t xfer;                // copy of the transfer the step continues with
+  tusb_control_request_t setup;   // its setup packet lives on the caller's stack
+} _enum_wait;
+
+static void enum_wait(uint8_t step, uint32_t ms, tuh_xfer_t const* xfer) {
+  if (xfer) {
+    _enum_wait.setup = *xfer->setup;
+    _enum_wait.xfer = *xfer;
+    _enum_wait.xfer.setup = &_enum_wait.setup;
+  }
+  _enum_wait.due_us = time_us_32() + ms * 1000;
+  _enum_wait.step = step;
+}
+
+static bool enum_wait_due(void) {
+  return _enum_wait.step != WAIT_NONE && (int32_t) (time_us_32() - _enum_wait.due_us) >= 0;
+}
+
 // process device enumeration
 static void process_enumeration(tuh_xfer_t* xfer) {
   // Retry a few times with transfers in enumeration since device can be unstable when starting up
@@ -1350,18 +1386,13 @@ static void process_enumeration(tuh_xfer_t* xfer) {
 
   if (XFER_RESULT_SUCCESS != xfer->result) {
     // retry if not reaching max attempt
-    bool retry = _dev0.enumerating && (failed_count < ATTEMPT_COUNT_MAX);
-    if ( retry ) {
+    if (_dev0.enumerating && (failed_count < ATTEMPT_COUNT_MAX)) {
       failed_count++;
-      osal_task_delay(ATTEMPT_DELAY_MS); // delay a bit
       TU_LOG1("Enumeration attempt %u\r\n", failed_count);
-      retry = tuh_control_xfer(xfer);
-    }
-
-    if (!retry) {
+      enum_wait(WAIT_RETRY, ATTEMPT_DELAY_MS, xfer);
+    } else {
       enum_full_complete();
     }
-
     return;
   }
   failed_count = 0;
@@ -1395,9 +1426,7 @@ static void process_enumeration(tuh_xfer_t* xfer) {
     }
 
     case ENUM_HUB_GET_STATUS_2:
-      osal_task_delay(ENUM_RESET_DELAY);
-      TU_ASSERT(hub_port_get_status(_dev0.hub_addr, _dev0.hub_port, _usbh_ctrl_buf,
-                                    process_enumeration, ENUM_HUB_CLEAR_RESET_2),);
+      enum_wait(WAIT_HUB_STATUS, ENUM_RESET_DELAY, NULL);
       break;
 
     case ENUM_HUB_CLEAR_RESET_2: {
@@ -1453,28 +1482,10 @@ static void process_enumeration(tuh_xfer_t* xfer) {
       enum_request_set_addr();
       break;
 
-    case ENUM_GET_DEVICE_DESC: {
+    case ENUM_GET_DEVICE_DESC:
       // Allow 2ms for address recovery time, Ref USB Spec 9.2.6.3
-      osal_task_delay(2);
-
-      uint8_t const new_addr = (uint8_t) tu_le16toh(xfer->setup->wValue);
-
-      usbh_device_t* new_dev = get_device(new_addr);
-      TU_ASSERT(new_dev,);
-      new_dev->addressed = 1;
-
-      // Close device 0
-      hcd_device_close(_dev0.rhport, 0);
-
-      // open control pipe for new address
-      TU_ASSERT(usbh_edpt_control_open(new_addr, new_dev->ep0_size),);
-
-      // Get full device descriptor
-      TU_LOG_USBH("Get Device Descriptor\r\n");
-      TU_ASSERT(tuh_descriptor_get_device(new_addr, _usbh_ctrl_buf, sizeof(tusb_desc_device_t),
-                                          process_enumeration, ENUM_GET_9BYTE_CONFIG_DESC),);
+      enum_wait(WAIT_ADDR_RECOVERY, 2, xfer);
       break;
-    }
 
     case ENUM_GET_9BYTE_CONFIG_DESC: {
       tusb_desc_device_t const* desc_device = (tusb_desc_device_t const*) _usbh_ctrl_buf;
@@ -1545,6 +1556,79 @@ static void process_enumeration(tuh_xfer_t* xfer) {
   }
 }
 
+static void enum_wait_run(void) {
+  if (!enum_wait_due()) return;
+
+  uint8_t const step = _enum_wait.step;
+  _enum_wait.step = WAIT_NONE;
+  if (!_dev0.enumerating) return; // unplugged while waiting
+
+  switch (step) {
+    case WAIT_RESET_END:
+      hcd_port_reset_end(_dev0.rhport);
+      enum_wait(WAIT_ROOT_STABLE, ENUM_CONTACT_DEBOUNCING_DELAY, NULL);
+      break;
+
+    case WAIT_ROOT_STABLE: {
+      if (!hcd_port_connect_status(_dev0.rhport)) {
+        enum_full_complete();
+        return;
+      }
+
+      _dev0.speed = hcd_port_speed_get(_dev0.rhport);
+      TU_LOG_USBH("%s Speed\r\n", tu_str_speed[_dev0.speed]);
+
+      // fake transfer to kick-off the enumeration process
+      tuh_xfer_t xfer;
+      xfer.daddr = 0;
+      xfer.result = XFER_RESULT_SUCCESS;
+      xfer.user_data = ENUM_ADDR0_DEVICE_DESC;
+      process_enumeration(&xfer);
+      break;
+    }
+
+#if CFG_TUH_HUB
+    case WAIT_HUB_STABLE:
+      TU_ASSERT(hub_port_get_status(_dev0.hub_addr, _dev0.hub_port, _usbh_ctrl_buf,
+                                    process_enumeration, ENUM_HUB_CLEAR_RESET_1),);
+      break;
+
+    case WAIT_HUB_STATUS:
+      TU_ASSERT(hub_port_get_status(_dev0.hub_addr, _dev0.hub_port, _usbh_ctrl_buf,
+                                    process_enumeration, ENUM_HUB_CLEAR_RESET_2),);
+      break;
+#endif
+
+    case WAIT_ADDR_RECOVERY: {
+      uint8_t const new_addr = (uint8_t) tu_le16toh(_enum_wait.setup.wValue);
+
+      usbh_device_t* new_dev = get_device(new_addr);
+      TU_ASSERT(new_dev,);
+      new_dev->addressed = 1;
+
+      // Close device 0
+      hcd_device_close(_dev0.rhport, 0);
+
+      // open control pipe for new address
+      TU_ASSERT(usbh_edpt_control_open(new_addr, new_dev->ep0_size),);
+
+      // Get full device descriptor
+      TU_LOG_USBH("Get Device Descriptor\r\n");
+      TU_ASSERT(tuh_descriptor_get_device(new_addr, _usbh_ctrl_buf, sizeof(tusb_desc_device_t),
+                                          process_enumeration, ENUM_GET_9BYTE_CONFIG_DESC),);
+      break;
+    }
+
+    case WAIT_RETRY:
+      if (!tuh_control_xfer(&_enum_wait.xfer)) {
+        enum_full_complete();
+      }
+      break;
+
+    default: break;
+  }
+}
+
 static bool enum_new_device(hcd_event_t* event) {
   _dev0.rhport = event->rhport;
   _dev0.hub_addr = event->connection.hub_addr;
@@ -1553,40 +1637,12 @@ static bool enum_new_device(hcd_event_t* event) {
   if (_dev0.hub_addr == 0) {
     // connected/disconnected directly with roothub
     hcd_port_reset(_dev0.rhport);
-    osal_task_delay(ENUM_RESET_DELAY); // TODO may not work for no-OS on MCU that require reset_end() since
-    // sof of controller may not running while resetting
-    hcd_port_reset_end(_dev0.rhport);
-
-    // wait until device connection is stable TODO non blocking
-    osal_task_delay(ENUM_CONTACT_DEBOUNCING_DELAY);
-
-    // device unplugged while delaying
-    if (!hcd_port_connect_status(_dev0.rhport)) {
-      enum_full_complete();
-      return true;
-    }
-
-    _dev0.speed = hcd_port_speed_get(_dev0.rhport);
-    TU_LOG_USBH("%s Speed\r\n", tu_str_speed[_dev0.speed]);
-
-    // fake transfer to kick-off the enumeration process
-    tuh_xfer_t xfer;
-    xfer.daddr = 0;
-    xfer.result = XFER_RESULT_SUCCESS;
-    xfer.user_data = ENUM_ADDR0_DEVICE_DESC;
-
-    process_enumeration(&xfer);
+    enum_wait(WAIT_RESET_END, ENUM_RESET_DELAY, NULL);
   }
 #if CFG_TUH_HUB
   else {
-    // connected/disconnected via external hub
-    // wait until device connection is stable TODO non blocking
-    osal_task_delay(ENUM_CONTACT_DEBOUNCING_DELAY);
-
-    // ENUM_HUB_GET_STATUS
-    //TU_ASSERT( hub_port_get_status(_dev0.hub_addr, _dev0.hub_port, _usbh_ctrl_buf, enum_hub_get_status0_complete, 0) );
-    TU_ASSERT(hub_port_get_status(_dev0.hub_addr, _dev0.hub_port, _usbh_ctrl_buf,
-                                  process_enumeration, ENUM_HUB_CLEAR_RESET_1));
+    // connected/disconnected via external hub: wait until device connection is stable
+    enum_wait(WAIT_HUB_STABLE, ENUM_CONTACT_DEBOUNCING_DELAY, NULL);
   }
 #endif // hub
 
