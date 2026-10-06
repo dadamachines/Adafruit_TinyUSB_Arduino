@@ -108,7 +108,11 @@ TU_ATTR_WEAK void tuh_mount_cb (uint8_t daddr);
 TU_ATTR_WEAK void tuh_umount_cb(uint8_t daddr);
 
 // Invoked when there is a new usb event, which need to be processed by tuh_task()/tuh_task_ext()
-void tuh_event_hook_cb(uint8_t rhport, uint32_t eventid, bool in_isr);
+// The transfer's device and endpoint are meaningful for HCD_EVENT_XFER_COMPLETE only.
+void tuh_event_hook_cb(uint8_t rhport, uint32_t eventid, bool in_isr, uint8_t dev_addr, uint8_t ep_addr);
+
+// True when an enumeration step's deadline has passed: tuh_task() must run.
+bool tuh_enum_step_due(void);
 
 //--------------------------------------------------------------------+
 // APPLICATION API

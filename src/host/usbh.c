@@ -64,10 +64,12 @@ TU_ATTR_WEAK bool hcd_configure(uint8_t rhport, uint32_t cfg_id, const void* cfg
   return false;
 }
 
-TU_ATTR_WEAK void tuh_event_hook_cb(uint8_t rhport, uint32_t eventid, bool in_isr) {
+TU_ATTR_WEAK void tuh_event_hook_cb(uint8_t rhport, uint32_t eventid, bool in_isr, uint8_t dev_addr, uint8_t ep_addr) {
   (void) rhport;
   (void) eventid;
   (void) in_isr;
+  (void) dev_addr;
+  (void) ep_addr;
 }
 
 //--------------------------------------------------------------------+
@@ -305,7 +307,6 @@ TU_ATTR_ALWAYS_INLINE static inline usbh_device_t* get_device(uint8_t dev_addr) 
 }
 
 static bool enum_new_device(hcd_event_t* event);
-static bool enum_wait_due(void);
 static void enum_wait_run(void);
 static void process_removing_device(uint8_t rhport, uint8_t hub_addr, uint8_t hub_port);
 static bool usbh_edpt_control_open(uint8_t dev_addr, uint8_t max_packet_size);
@@ -322,7 +323,7 @@ TU_ATTR_WEAK void osal_task_delay(uint32_t msec) {
 
 TU_ATTR_ALWAYS_INLINE static inline bool queue_event(hcd_event_t const * event, bool in_isr) {
   TU_ASSERT(osal_queue_send(_usbh_q, event, in_isr));
-  tuh_event_hook_cb(event->rhport, event->event_id, in_isr);
+  tuh_event_hook_cb(event->rhport, event->event_id, in_isr, event->dev_addr, event->xfer_complete.ep_addr);
   return true;
 }
 
@@ -483,7 +484,7 @@ bool tuh_task_event_ready(void) {
   // Skip if stack is not initialized
   if ( !tuh_inited() ) return false;
 
-  return !osal_queue_empty(_usbh_q) || enum_wait_due();
+  return !osal_queue_empty(_usbh_q) || tuh_enum_step_due();
 }
 
 /* USB Host Driver task
@@ -1371,7 +1372,8 @@ static void enum_wait(uint8_t step, uint32_t ms, tuh_xfer_t const* xfer) {
   _enum_wait.step = step;
 }
 
-static bool enum_wait_due(void) {
+// In SRAM: the firmware asks it on every pass of a core that must not run flash when idle.
+bool __not_in_flash_func(tuh_enum_step_due)(void) {
   return _enum_wait.step != WAIT_NONE && (int32_t) (time_us_32() - _enum_wait.due_us) >= 0;
 }
 
@@ -1557,7 +1559,7 @@ static void process_enumeration(tuh_xfer_t* xfer) {
 }
 
 static void enum_wait_run(void) {
-  if (!enum_wait_due()) return;
+  if (!tuh_enum_step_due()) return;
 
   uint8_t const step = _enum_wait.step;
   _enum_wait.step = WAIT_NONE;

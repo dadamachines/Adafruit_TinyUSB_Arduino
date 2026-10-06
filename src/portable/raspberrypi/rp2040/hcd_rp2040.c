@@ -512,8 +512,12 @@ static void __tusb_irq_path_func(hcd_schedule_next_transfer)()
   }
 }
 
+// Asked first in every host-controller interrupt; false leaves the interrupt for the application to take up later.
+TU_ATTR_WEAK bool hcd_rp2040_irq_admit(void) { return true; }
+
 static void __tusb_irq_path_func(hcd_rp2040_irq)(void)
 {
+  if (!hcd_rp2040_irq_admit()) return;
   uint32_t status = usb_hw->ints;
   uint32_t handled = 0;
   uint8_t current_edpt = (usb_hw->dev_addr_ctrl & USB_ADDR_ENDP_ENDPOINT_BITS) >> USB_ADDR_ENDP_ENDPOINT_LSB;
