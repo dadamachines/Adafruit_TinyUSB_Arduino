@@ -516,10 +516,15 @@ static void __tusb_irq_path_func(hcd_schedule_next_transfer)()
 // The bus changed (a device came or went): what was in flight belonged to the old device, and nothing will finish it.
 static void __tusb_irq_path_func(hw_bus_changed)(void)
 {
+  // A control transfer that is waiting or in flight ends as FAILED: the stack frees its one control slot on an event only.
+  const bool waiting = control_xfers[0].setup_pending || control_xfers[0].data_pending;
+  const bool running = epx.active && tu_edpt_number(epx.ep_addr) == 0;
+  const uint8_t daddr = running ? epx.dev_addr : 0;
   control_xfers[0].setup_pending = control_xfers[0].data_pending = false;  // addressed devices' are cleared by hcd_device_close
   active_xfer.pht = NULL;
   epx.active = false;
   if (epx.buffer_control) *epx.buffer_control = 0;
+  if (waiting || running) hcd_event_xfer_complete(daddr, 0, 0, XFER_RESULT_FAILED, true);
 }
 
 // The device did not finish a control transfer: clear what the controller left in the buffer and tell the stack.
