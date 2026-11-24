@@ -525,13 +525,10 @@ void tuh_task_ext(uint32_t timeout_ms, bool in_isr) {
         if (_dev0.enumerating) {
           TU_LOG_USBH("[%u:] USBH Defer Attach until current enumeration complete\r\n", event.rhport);
 
-          bool is_empty = osal_queue_empty(_usbh_q);
           queue_event(&event, in_isr);
-
-          if (is_empty) {
-            // Exit if this is the only event in the queue, otherwise we may loop forever
-            return;
-          }
+          // Exit: two deferred attaches would go round for ever here, and the enumeration's waits run at the top only.
+          // Its event hook makes the application call again; the events behind this one come then.
+          return;
         } else {
           TU_LOG_USBH("[%u:] USBH DEVICE ATTACH\r\n", event.rhport);
           _dev0.enumerating = 1;
