@@ -243,8 +243,8 @@ static void __tusb_irq_path_func(hw_xfer_complete)(struct hw_endpoint *ep, xfer_
 static void __tusb_irq_path_func(_handle_buff_status_bit)(uint bit, struct hw_endpoint *ep)
 {
   usb_hw_clear->buf_status = bit;
-  // EP may have been stalled?
-  assert(ep->active);
+  // EP may have been stalled, or closed by an unplug
+  if (!ep->active) { HCD_FAIL(ep); return; }
   bool done = hw_endpoint_xfer_continue(ep);
   if ( done )
   {
@@ -303,7 +303,8 @@ static void __tusb_irq_path_func(hw_handle_buff_status)(void)
 
   if ( remaining_buffers )
   {
-    panic("Unhandled buffer %d\n", remaining_buffers);
+    HCD_FAIL(&epx);
+    usb_hw_clear->buf_status = remaining_buffers;
   }
 }
 
@@ -313,7 +314,7 @@ static void __tusb_irq_path_func(hw_trans_complete)(void)
   {
     pico_trace("Sent setup packet\n");
     struct hw_endpoint *ep = &epx;
-    assert(ep->active);
+    if (!ep->active) { HCD_FAIL(ep); return; }
     // Set transferred length to 8 for a setup packet
     ep->xferred_len = 8;
     hw_xfer_complete(ep, XFER_RESULT_SUCCESS);
@@ -512,6 +513,25 @@ static void __tusb_irq_path_func(hcd_schedule_next_transfer)()
   }
 }
 
+// The bus changed (a device came or went): what was in flight belonged to the old device, and nothing will finish it.
+static void __tusb_irq_path_func(hw_bus_changed)(void)
+{
+  control_xfers[0].setup_pending = control_xfers[0].data_pending = false;  // addressed devices' are cleared by hcd_device_close
+  active_xfer.pht = NULL;
+  epx.active = false;
+  if (epx.buffer_control) *epx.buffer_control = 0;
+}
+
+// The device did not finish a control transfer: clear what the controller left in the buffer and tell the stack.
+static void __attribute__((noinline)) __tusb_irq_path_func(hw_ctrl_failed)(void)
+{
+  if (epx.active)
+  {
+    *epx.buffer_control = 0;
+    hw_xfer_complete(&epx, XFER_RESULT_FAILED);
+  }
+}
+
 // Asked first in every host-controller interrupt; false leaves the interrupt for the application to take up later.
 TU_ATTR_WEAK bool hcd_rp2040_irq_admit(void) { return true; }
 
@@ -529,6 +549,7 @@ static void __tusb_irq_path_func(hcd_rp2040_irq)(void)
   if ( status & USB_INTS_HOST_CONN_DIS_BITS )
   {
     handled |= USB_INTS_HOST_CONN_DIS_BITS;
+    hw_bus_changed();
 
     if ( dev_speed() )
     {
@@ -556,6 +577,7 @@ static void __tusb_irq_path_func(hcd_rp2040_irq)(void)
 
   if ( status & USB_INTS_STALL_BITS )
   {
+    handled |= USB_INTS_STALL_BITS;
     if (usb_hw->sie_status & USB_SIE_STATUS_STALL_REC_BITS)
     {
       // We have rx'd a stall from the device
@@ -563,7 +585,6 @@ static void __tusb_irq_path_func(hcd_rp2040_irq)(void)
       // AND TRANS_COMPLETE as the stall is an alternative response
       // to one of those events
       pico_trace("Stall REC\n");
-      handled |= USB_INTS_STALL_BITS;
       usb_hw_clear->sie_status = USB_SIE_STATUS_STALL_REC_BITS;
       hw_xfer_complete(&epx, XFER_RESULT_STALLED);
     }
@@ -576,15 +597,13 @@ static void __tusb_irq_path_func(hcd_rp2040_irq)(void)
     TU_LOG(1, "  Seq Error: %08lx, [0] = 0x%04u  [1] = 0x%04x\r\n", *epx.buffer_control,
            tu_u32_low16(*epx.buffer_control),
            tu_u32_high16(*epx.buffer_control));
-    // For control transfers, this is bad. For other transfers, just drop the data
+    // For control transfers, this is bad: fail the transfer (the stack retries the enumeration). For other transfers, just drop the data
+    drop_data = true;
     if (is_control_xfer)
-      panic("Data Seq Error \n");
+      hw_ctrl_failed();
     else
-    {
-      drop_data = true;
       // put the next_pid value back where it should be
       epx.next_pid ^= 1u;
-    }
   }
 
   if ( usb_hw->sie_status & USB_SIE_STATUS_NAK_REC_BITS )
@@ -622,7 +641,10 @@ static void __tusb_irq_path_func(hcd_rp2040_irq)(void)
     if (drop_data)
     {
       TU_LOG(3, "complete: buffer dropped %02x/%02x\r\n", current_daddr, current_edpt);
-      hw_endpoint_reset_transfer(&epx);
+      if (is_control_xfer)
+        hw_ctrl_failed();  // a timed-out control transfer ends as FAILED
+      else
+        hw_endpoint_reset_transfer(&epx);
       if (active_xfer.pht != NULL)
       {
         ep_pool[active_xfer.idx].active = false;
@@ -651,7 +673,7 @@ static void __tusb_irq_path_func(hcd_rp2040_irq)(void)
 
   if ( status ^ handled )
   {
-    panic("Unhandled IRQ 0x%x\n", (uint) (status ^ handled));
+    HCD_FAIL(&epx);
   }
   if (attached)
     hcd_schedule_next_transfer();
@@ -805,7 +827,7 @@ bool hcd_init(uint8_t rhport, const tusb_rhport_init_t* rh_init)
   usb_hw->sie_ctrl = SIE_CTRL_BASE;
   usb_hw->inte = USB_INTE_BUFF_STATUS_BITS      |
                  USB_INTE_HOST_CONN_DIS_BITS    |
-                 USB_INTE_HOST_RESUME_BITS      |
+                 // no HOST_RESUME: the bus is never suspended here and the handler has no branch for it
                  USB_INTE_STALL_BITS            |
                  USB_INTE_TRANS_COMPLETE_BITS   |
                  USB_INTE_ERROR_RX_TIMEOUT_BITS |
@@ -863,8 +885,8 @@ tusb_speed_t hcd_port_speed_get(uint8_t rhport)
     case 2:
       return TUSB_SPEED_FULL;
     default:
-      panic("Invalid speed\n");
-      // return TUSB_SPEED_INVALID;
+      HCD_FAIL(&epx);  // the plug went away: the enumeration fails on its own and is retried
+      return TUSB_SPEED_FULL;
   }
 }
 
@@ -1021,7 +1043,7 @@ bool hcd_edpt_xfer(uint8_t rhport, uint8_t dev_addr, uint8_t ep_addr, uint8_t * 
     }
     // Add the transfer to the appropriate pending transfer list
     if (!hw_add_pending_xfer(next_list, (uint8_t)ep_idx))
-      panic("Cannot schedule new xfer\r\n");
+    { HCD_FAIL(&epx); return false; }
   }
   // next call schedule_next_transfer() will start the transfer
   // if no other higher priority transfer is pending

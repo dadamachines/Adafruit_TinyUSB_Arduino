@@ -42,6 +42,11 @@
 #define pico_info(...)  TU_LOG(2, __VA_ARGS__)
 #define pico_trace(...) TU_LOG(3, __VA_ARGS__)
 
+// A bus event the driver cannot honour is dropped, never a panic or an assert: the host controller's interrupt runs on the
+// audio-critical core, and a plug, an unplug or a noisy cable must not stop it. The hook is empty: a count would cost
+// RAM-resident code, and the RP2350's SRAM code is at its limit (the endpoint's unused `pending` byte is where one would go).
+#define HCD_FAIL(ep) ((void)(ep))
+
 // Hardware information per endpoint
 typedef struct hw_endpoint
 {

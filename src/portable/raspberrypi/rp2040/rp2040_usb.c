@@ -105,7 +105,7 @@ void __tusb_irq_path_func(_hw_endpoint_buffer_control_update32)(struct hw_endpoi
     value |= or_mask;
     if (or_mask & USB_BUF_CTRL_AVAIL) {
       if (*ep->buffer_control & USB_BUF_CTRL_AVAIL) {
-        panic("ep %02X was already available", ep->ep_addr);
+        HCD_FAIL(ep);  // a timed-out control read left it set: the write below replaces it
       }
       *ep->buffer_control = value & ~USB_BUF_CTRL_AVAIL;
       // 4.1.2.5.1 Con-current access: 12 cycles (should be good for 48*12Mhz = 576Mhz) after write to buffer control
@@ -228,13 +228,13 @@ static uint16_t __tusb_irq_path_func(sync_ep_buffer)(struct hw_endpoint* ep, uin
   if (!ep->rx) {
     // We are continuing a transfer here. If we are TX, we have successfully
     // sent some data can increase the length we have sent
-    assert(!(buf_ctrl & USB_BUF_CTRL_FULL));
+    if (buf_ctrl & USB_BUF_CTRL_FULL) { HCD_FAIL(ep); ep->remaining_len = 0; return 0; }
 
     ep->xferred_len = (uint16_t) (ep->xferred_len + xferred_bytes);
   } else {
     // If we have received some data, so can increase the length
     // we have received AFTER we have copied it to the user buffer at the appropriate offset
-    assert(buf_ctrl & USB_BUF_CTRL_FULL);
+    if (!(buf_ctrl & USB_BUF_CTRL_FULL)) { HCD_FAIL(ep); ep->remaining_len = 0; return 0; }
 
     unaligned_memcpy(ep->user_buf, ep->hw_data_buf + buf_id * 64, xferred_bytes);
     ep->xferred_len = (uint16_t) (ep->xferred_len + xferred_bytes);
