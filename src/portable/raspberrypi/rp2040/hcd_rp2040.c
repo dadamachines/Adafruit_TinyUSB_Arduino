@@ -535,7 +535,7 @@ static void __attribute__((noinline)) __tusb_irq_path_func(hw_ctrl_failed)(void)
 // Asked first in every host-controller interrupt; false leaves the interrupt for the application to take up later.
 TU_ATTR_WEAK bool hcd_rp2040_irq_admit(void) { return true; }
 
-static void __tusb_irq_path_func(hcd_rp2040_irq)(void)
+static void __attribute__((optimize("Os"))) __tusb_irq_path_func(hcd_rp2040_irq)(void)
 {
   if (!hcd_rp2040_irq_admit()) return;
   uint32_t status = usb_hw->ints;
